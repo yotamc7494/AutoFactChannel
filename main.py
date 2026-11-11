@@ -143,15 +143,8 @@ SEGMENT_PAD = 0.30  # silence after the last word of a scene
 END_PAD = 0.80  # hold on the last picture
 SENTENCE_GAP = 0.14
 SPEED_SCALE_CAP = 1.25  # TTS may be sped up by at most this factor to fit MAX_VIDEO_SECONDS
-INTRO_TEMPLATES = [
-    "Here are 5 facts you didn't know about {subject}.",
-    "5 surprising facts about {subject} you need to hear.",
-    "Think you know {subject}? Here are 5 facts that might surprise you.",
-    "Here are 5 incredible things about {subject} you probably never knew.",
-    "You won't believe these 5 facts about {subject}.",
-    "Let's explore 5 fascinating facts about {subject}.",
-    "5 things about {subject} that most people don't know.",
-]
+# Used ONLY if Gemini is completely unavailable. The normal path is 100% AI-written.
+FALLBACK_OPENING = "Here are 5 facts about {subject} that you probably never knew."
 
 # --- Voices (Kokoro) ---
 HOST_VOICE, HOST_SPEED = "am_liam", 1.15
@@ -183,10 +176,14 @@ class SfxType(str, Enum):
 
 
 class IntroPlan(_Model):
-    subject: str = Field(description="The topic as a short natural noun phrase (1-5 words) that fits the sentence "
-                                     "'Here are 5 facts you didn't know about ___'")
+    subject: str = Field(description="The topic as a short natural noun phrase (1-5 words), e.g. 'deep space'")
+    title: str = Field(description="YouTube Short title, 30-70 characters, a curiosity hook that stays true to the "
+                                   "facts. No hashtags, no emojis, no ALL CAPS words")
+    opening_line: str = Field(description="First words spoken in the video: 1-2 short sentences, 8-20 words. Names the "
+                                          "subject, promises five facts, gives a reason to keep watching")
     image_prompt: str = Field(description="One striking photorealistic scene that represents the whole topic, 9:16")
-    description: str = Field(description="30-60 words, conversational, no hashtags, no claims beyond the supplied facts")
+    description: str = Field(description="YouTube description, 40-90 words, conversational, no claims beyond the "
+                                         "supplied facts, ends with 3-5 relevant hashtags including #Shorts")
     tags: str = Field(description="6 to 10 comma-separated tags")
 
 
@@ -499,12 +496,75 @@ def normalize_intro(p: IntroPlan) -> IntroPlan:
     p.subject = ascii_clean(p.subject).strip(" .!?\"'")
     if not 1 <= len(p.subject.split()) <= 6 or re.search(r"\bfacts?\b|^\d", p.subject, re.I):
         raise ValueError(f"unusable subject '{p.subject}'")
+
+    p.title = re.sub(r"#\S+", "", ascii_clean(p.title)).strip(" \"'")
+    if not 20 <= len(p.title) <= 100 or len(p.title.split()) < 3:
+        raise ValueError(f"title has {len(p.title)} characters (allowed 20-100)")
+    if sum(1 for w in p.title.split() if len(w) > 3 and w.isupper()) >= 2:
+        raise ValueError("title uses ALL CAPS words")
+
+    p.opening_line = clean_narration(p.opening_line)
+    words = len(p.opening_line.split())
+    if not 6 <= words <= 26:
+        raise ValueError(f"opening line has {words} words (allowed 6-26)")
+    if GREETING.search(p.opening_line):
+        raise ValueError("opening line starts with a greeting")
+    if not re.search(r"\b(?:5|five)\b", p.opening_line, re.I):
+        raise ValueError("opening line does not promise the five facts")
+    stems = _content_stems(p.subject)
+    if stems and not stems & _content_stems(p.opening_line):
+        raise ValueError("opening line does not mention the subject")
+
     p.image_prompt = ascii_clean(p.image_prompt)
     if len(p.image_prompt.split()) < 8:
         raise ValueError("image_prompt is too short")
+
     p.description = ascii_clean(p.description)
+    if not 25 <= len(p.description.split()) <= 140:
+        raise ValueError("description length is out of range")
     p.tags = ascii_clean(p.tags)
     return p
+
+
+def write_intro(entry: dict) -> IntroPlan:
+    from google.genai import types
+    logger.info("Writer: title, opening line and description for '%s'", entry["title"])
+    facts = "\n".join(f"  {i + 1}. {f}" for i, f in enumerate(entry["facts"]))
+    prompt = f"""
+            You are packaging a YouTube Short. Its working title is "{entry['title']}" and it presents these five facts:
+        {facts}
+
+            Return:
+            - subject: the topic as a short natural noun phrase (1-5 words), e.g. 'deep space', 'your brain',
+              'ancient Egypt'.
+            - title: the YouTube title. Write a fresh, original hook of 30-70 characters that makes someone stop
+              scrolling: a question, a surprising claim or a bold contrast drawn from the facts. It must be true to the
+              facts and must NOT simply copy the working title. No hashtags, no emojis, no ALL CAPS words.
+            - opening_line: the very first words spoken in the video (8-20 words, one or two short sentences). Name
+              the subject, tell the viewer five facts are coming and give them a reason to stay. Invent it fresh in a
+              natural spoken voice: no greeting, no 'did you know', and do NOT fall back on a stock formula like
+              'Here are 5 facts about ...'.
+            - image_prompt: ONE striking photorealistic establishing scene that represents the WHOLE topic and works
+              as the opening shot of the video.
+            - description: 40-90 words. A hook first, then tease what the viewer will learn without listing all five
+              facts word for word, then a closing line of 3-5 relevant hashtags that includes #Shorts. No claims beyond
+              the supplied facts.
+            - tags: 6-10 comma-separated tags.
+
+            {STYLE_GUIDE}
+            """
+    try:
+        return ask_llm(prompt, config=_gen_config(types, IntroPlan, 0.9),
+                       parse=lambda r: normalize_intro(IntroPlan.model_validate_json(r.text)),
+                       max_rounds=WRITER_MAX_ROUNDS)
+    except LLMUnavailableError:
+        subject = subject_from_title(entry["title"])
+        logger.warning("Intro writer unavailable; using a plain fallback intro for '%s'", subject)
+        return IntroPlan(subject=subject, title=shorten(entry["title"], 100),
+                         opening_line=FALLBACK_OPENING.format(subject=subject), tags="facts, did you know, shorts",
+                         description=entry["title"] + ". " + " ".join(entry["facts"][:2]) + " #Shorts #Facts",
+                         image_prompt=f"Cinematic photorealistic wide establishing shot that represents {subject}, "
+                                      "dramatic lighting, rich detail, vertical composition")
 
 
 STYLE_GUIDE = """
@@ -524,37 +584,6 @@ STYLE_GUIDE = """
         it matters ('exactly three'). Never include text, letters, logos, watermarks, real named people, celebrities,
         gore, copyrighted characters, collages or split screens.
         """
-
-
-def write_intro(entry: dict) -> IntroPlan:
-    from google.genai import types
-    logger.info("Writer: intro for '%s'", entry["title"])
-    facts = "\n".join(f"  {i + 1}. {f}" for i, f in enumerate(entry["facts"]))
-    prompt = f"""
-            You are opening a YouTube Short titled "{entry['title']}". It presents these five facts:
-        {facts}
-
-            Return:
-            - subject: the topic of the video as a short natural noun phrase (1-5 words) that fits the sentence
-              "Here are 5 facts you didn't know about ___". Examples: 'deep space', 'your brain', 'ancient Egypt'.
-            - image_prompt: ONE striking photorealistic establishing scene that represents the WHOLE topic and works as
-              the opening shot of the video.
-            - description: 30-60 words, conversational, no hashtags, no claims beyond the supplied facts.
-            - tags: 6-10 comma-separated tags.
-
-            {STYLE_GUIDE}
-            """
-    try:
-        return ask_llm(prompt, config=_gen_config(types, IntroPlan, 0.7),
-                       parse=lambda r: normalize_intro(IntroPlan.model_validate_json(r.text)),
-                       max_rounds=WRITER_MAX_ROUNDS)
-    except LLMUnavailableError:
-        subject = subject_from_title(entry["title"])
-        logger.warning("Intro writer unavailable; using a plain intro for '%s'", subject)
-        return IntroPlan(subject=subject, tags="facts, did you know, shorts",
-                         description=entry["title"] + ". " + " ".join(entry["facts"][:2]),
-                         image_prompt=f"Cinematic photorealistic wide establishing shot that represents {subject}, "
-                                      "dramatic lighting, rich detail, vertical composition")
 
 
 def write_fact(entry: dict, subject: str, index: int, previous_tail: str) -> FactSegment:
@@ -601,16 +630,15 @@ def write_fact(entry: dict, subject: str, index: int, previous_tail: str) -> Fac
 
 def generate_timeline(entry: dict) -> ShortTimeline:
     intro = write_intro(entry)
-    intro_script = random.choice(INTRO_TEMPLATES).format(
-        subject=intro.subject
-    )
-    segments = [FactSegment(script=intro_script, image_prompt=intro.image_prompt, sfx=SfxType.none.value)]
-    tail = intro_script
+    logger.info("AI title: %s", intro.title)
+    logger.info("AI opening line: %s", intro.opening_line)
+    segments = [FactSegment(script=intro.opening_line, image_prompt=intro.image_prompt, sfx=SfxType.none.value)]
+    tail = intro.opening_line
     for i in range(len(entry["facts"])):
         seg = write_fact(entry, intro.subject, i, tail)
         segments.append(seg)
         tail = shorten(seg.script, 160)
-    return ShortTimeline(day=entry["day"], title=entry["title"], subject=intro.subject, description=intro.description,
+    return ShortTimeline(day=entry["day"], title=intro.title, subject=intro.subject, description=intro.description,
                          tags=intro.tags, facts=list(entry["facts"]), segments=segments)
 
 
@@ -1483,41 +1511,16 @@ def choose_transitions(count: int, spec: str, seed: int) -> List[Optional[str]]:
     return result
 
 
-def build_youtube_description(master: ShortTimeline) -> str:
-    facts = "\n".join(f"{i}. {f}" for i, f in enumerate(master.facts, start=1))
-    return f"{master.description.strip()}\n\nTHE 5 FACTS\n{facts}\n\n#Shorts #Facts #DidYouKnow"
-
-
 def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int] = None,
                         date: Optional[datetime.date] = None, topics_path: Optional[str] = None,
-                        save_script: Optional[str] = None, load_script: Optional[str] = None,
-                        work_dir_arg: Optional[str] = None, upload=False) -> str:
+                        upload=False) -> str:
     logger.info("Launching AutoShorts pipeline (vertical 1080x1920)...")
-    persistent = bool(work_dir_arg)
-    if persistent:
-        work_dir = Path(work_dir_arg)
-        work_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Using persistent work dir {work_dir} (finished scenes, images and voiceover are reused)")
-    else:
-        work_dir = Path(tempfile.mkdtemp(prefix="auto_shorts_"))
+    work_dir = Path(tempfile.mkdtemp(prefix="auto_shorts_"))  # everything intermediate lives here and is deleted
     try:
         # ---- Phase A: topic of the day -> Writers -> master timeline ----
-        auto_script = work_dir / "script.json"
-        if persistent and not load_script and auto_script.exists():
-            load_script = str(auto_script)  # same work dir = same video: never mix scenes of two scripts
-            logger.info("Work dir already holds a script: resuming that video")
-        if load_script:
-            master = ShortTimeline.model_validate_json(Path(load_script).read_text(encoding="utf-8"))
-            logger.info(f"Loaded script from {load_script}")
-        else:
-            master = generate_timeline(load_topic_for_day(Path(topics_path) if topics_path else TOPICS_FILE, day, date))
-        for seg in master.segments[1:]:  # segment 0 is the fixed intro sentence
+        master = generate_timeline(load_topic_for_day(Path(topics_path) if topics_path else TOPICS_FILE, day, date))
+        for seg in master.segments[1:]:  # segment 0 is the AI opening line
             normalize_fact(seg)
-        if persistent and not auto_script.exists():
-            auto_script.write_text(master.model_dump_json(indent=2), encoding="utf-8")
-        if save_script:
-            Path(save_script).write_text(master.model_dump_json(indent=2), encoding="utf-8")
-            logger.info("Final script saved to %s", save_script)
         segs = list(master.segments)
         n = len(segs)
         logger.info("=" * 60)
@@ -1534,7 +1537,6 @@ def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int
             image_future = pool.submit(generate_images, segs, work_dir)
             speech_items, tts = run_tts_fitted(segs, work_dir, transitions_on)
             image_paths = image_future.result()
-        # Match every caption word to the finished narration audio, not word lengths.
         aligned_words = run_word_alignment(speech_items, tts, work_dir)
         offsets = voice_offsets(n, transitions_on)
         durations = [r["duration"] for r in tts]
@@ -1570,28 +1572,23 @@ def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int
             out_dir = BASE_DIR / "output"
             out_dir.mkdir(parents=True, exist_ok=True)
             output_filename = str(out_dir / f"SHORT_DAY{master.day:03d}_{datetime.datetime.now():%Y%m%d_%H%M%S}.mp4")
-        description = build_youtube_description(master)
-        tags = [t.strip() for t in master.tags.split(",") if t.strip()]
         Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_filename).with_suffix(".description.txt").write_text(description + "\n", encoding="utf-8")
-        Path(output_filename).with_suffix(".youtube.json").write_text(
-            json.dumps({"day": master.day, "title": shorten(master.title, 100), "description": description,
-                        "tags": tags}, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # ---- Phase E: render (one worker per scene, several at once) + assemble ----
+        # ---- Phase E: render + assemble (the ONLY file that leaves the temp folder) ----
         scene_paths = render_all_scenes(jobs, work_dir)
         assemble_final_video(scene_paths, cursor, output_filename, work_dir)
         logger.info(f"SUCCESS! Short saved as: {output_filename} ({fmt_ts(cursor)})")
+
         if upload:
             from uploader import upload_video
-            upload_video(file_path=output_filename,title=master.title, description=description, tags=tags)
+            tags = [t.strip() for t in master.tags.split(",") if t.strip()]
+            logger.info("Uploading with AI title: %s", master.title)
+            upload_video(file_path=output_filename, title=shorten(master.title, 100),
+                         description=master.description, tags=tags)
         return output_filename
     finally:
-        if persistent:
-            logger.info(f"Work dir kept: {work_dir} (delete it when you are happy with the video)")
-        else:
-            logger.info("Cleaning up temporary files...")
-            shutil.rmtree(work_dir, ignore_errors=True)
+        logger.info("Cleaning up temporary files...")
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # =====================================================================
@@ -1617,10 +1614,6 @@ def main() -> None:
     parser.add_argument("--date", default=None, help="use the day of the year of this date (YYYY-MM-DD)")
     parser.add_argument("--topics", default=None, help=f"topics file (default {TOPICS_FILE.name})")
     parser.add_argument("--output", default=None, help="output mp4 path (default: output/SHORT_DAY###_<timestamp>.mp4)")
-    parser.add_argument("--save-script", default=None, help="save the generated script (master timeline) as JSON")
-    parser.add_argument("--load-script", default=None, help="skip the LLM and load a saved script")
-    parser.add_argument("--work-dir", default=None,
-                        help="keep images/voiceover/scenes here; re-running with the same folder resumes a crashed run")
     parser.add_argument("--no-music", action="store_true", help="do not mix background music")
     parser.add_argument("--no-sfx", action="store_true", help="no whoosh / sound effects")
     parser.add_argument("--zoom", type=float, default=None, help=f"zoom reached at the end of each scene (default {ZOOM_END})")
@@ -1658,8 +1651,7 @@ def main() -> None:
     if cli.render_workers:
         RENDER_WORKERS = max(1, cli.render_workers)
     date = datetime.date.fromisoformat(cli.date) if cli.date else None
-    run_shorts_pipeline(output_filename=cli.output, day=cli.day, date=date, topics_path=cli.topics,
-                        save_script=cli.save_script, load_script=cli.load_script, work_dir_arg=cli.work_dir, upload=True)
+    run_shorts_pipeline(output_filename=cli.output, day=cli.day, date=date, topics_path=cli.topics, upload=True)
 
 
 if __name__ == "__main__":
