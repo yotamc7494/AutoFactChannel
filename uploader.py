@@ -8,6 +8,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
+from datetime import datetime, timezone, timedelta
 import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()
@@ -19,6 +20,19 @@ SCOPES = [
     'https://www.googleapis.com/auth/youtube.force-ssl',
 ]
 
+
+def get_publish_at_iso(target_hour_utc: int = 20) -> str:
+    """מחשב תאריך ISO בדיוק לשעה 20:00 UTC (22:00 ישראל).
+    אם השעה הושגה היום, מזיז אוטומטית למחר.
+    """
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=target_hour_utc, minute=0, second=0, microsecond=0)
+
+    # אם השעה 20:00 UTC כבר עברה היום, נתזמן למחר
+    if now >= target:
+        target += timedelta(days=1)
+
+    return target.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def upload_video(
     file_path,
@@ -85,7 +99,7 @@ def upload_video(
           "defaultAudioLanguage": language,
       },
       "status": {
-          "publishAt": "2026-11-12T20:00:00Z",
+          "publishAt": get_publish_at_iso(20),
           "privacyStatus": privacy_status,
           "selfDeclaredMadeForKids": False,
           "containsSyntheticMedia": True,
