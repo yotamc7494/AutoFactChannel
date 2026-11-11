@@ -1,0 +1,15 @@
+name: Keep-Alive Streamlit App
+
+on:
+  schedule:
+    # הרצה כל 5 דקות (cron syntax)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Ping to Streamlit
+        run: |
+          curl -s "https://autofactchannel.streamlit.app/?trigger=ping&secret=${{ secrets.WEBHOOK_SECRET }}"
