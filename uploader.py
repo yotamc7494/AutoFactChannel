@@ -26,7 +26,7 @@ def upload_video(
     description,
     tags,
     category_id="27",
-    privacy_status="public",
+    privacy_status="private",
     auto_delete=True,
     thumbnail_path=None,
     language="en",
@@ -85,6 +85,7 @@ def upload_video(
           "defaultAudioLanguage": language,
       },
       "status": {
+          "publishAt": "2026-11-12T20:00:00Z",
           "privacyStatus": privacy_status,
           "selfDeclaredMadeForKids": False,
           "containsSyntheticMedia": True,
