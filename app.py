@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from main import run_shorts_pipeline
-
+from streamlit.logger import get_logger
 st.set_page_config(page_title="YouTube Shorts Generator", page_icon="🎬", layout="centered")
 
 # --- 1. טיפול בקריאות Webhook מרחוק (Ping / Upload) ---
@@ -11,11 +11,14 @@ query_params = st.query_params
 trigger = query_params.get("trigger")
 provided_secret = query_params.get("secret")
 
+logger = get_logger(__name__)
+
 if trigger:
     if provided_secret == WEBHOOK_SECRET:
         # PING קל: מונע הירדמות ללא הפעלת הפייפליין הכבד
         if trigger == "ping":
             print("ping")
+            logger.warning("🟢 [PING] Keep-Alive Ping Received!")
             st.write("PONG 🏓 - App is awake and ready!")
             st.stop()
 
