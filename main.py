@@ -3,7 +3,8 @@
 auto_shorts_generator.py - retention-first VERTICAL (9:16) "5 facts you didn't know" YouTube Shorts generator.
 
 Same architecture as weekly_recap.py (minus upload and thumbnail):
-  A. Topic: topics.json entry for TODAY's day of the year (title + the 5 facts). No random topics, no duplicates.
+  A. Topic: a RANDOM topics.json entry (title + the 5 facts). Stateless on purpose (the server's filesystem resets
+     on every run), so a topic can come up again; with a ~180 topic pool that is an occasional repeat.
      Writer LLM (one call for the intro, one call PER fact) -> master timeline (script.json)
         scene 1  = intro: topic image + "Here are 5 facts you didn't know about X"
         scene 2-6 = one scene per fact; every narration opens with the fact itself, then explains it
@@ -15,7 +16,7 @@ Same architecture as weekly_recap.py (minus upload and thumbnail):
   E. Assemble: ffmpeg concat demuxer (stream copy) + optional ducked background music.
 
 Usage
-  python auto_shorts_generator.py [--day 42 | --date 2026-11-11] [--topics topics.json] [--output out.mp4]
+  python auto_shorts_generator.py [--day 42] [--topics topics.json] [--output out.mp4]
                                   [--work-dir DIR] [--save-script s.json] [--load-script s.json]
                                   [--no-music] [--no-sfx] [--zoom 1.30] [--zoom-start 1.0]
                                   [--zoom-curve linear|ease_out|ease_in_out]
@@ -323,27 +324,61 @@ def write_wav_mono(path: str, samples: np.ndarray, sr: int) -> None:
 
 
 # =====================================================================
-# 3. TOPIC OF THE DAY  (topics.json: [{day, title, facts: [5 strings]}, ...])
+# 3. TOPIC SELECTION  (topics.json: [{day, title, facts: [5 strings]}, ...])
+#    Plain random pick from the curated pool. No state is stored anywhere.
+#    "day" is just a unique id here (it no longer means day of the year).
 # =====================================================================
-def load_topic_for_day(topics_path: Path, day: Optional[int] = None,
-                       date: Optional[datetime.date] = None) -> dict:
-    """Day of the year (1-366) selects the entry. Day 366 (leap years) wraps to entry 1."""
+def _normalize_topic(entry: Any) -> Optional[dict]:
+    """A valid topics.json entry -> {day, title, facts}; anything malformed -> None."""
     try:
-        topics = sorted(json.loads(topics_path.read_text(encoding="utf-8")), key=lambda t: int(t["day"]))
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        day = int(entry["day"])
+        title = ascii_clean(str(entry.get("title", "")))
+        facts = [ascii_clean(str(f)) for f in entry.get("facts", []) if ascii_clean(str(f))]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if not title or len(facts) != FACTS_COUNT:
+        return None
+    return {"day": day, "title": title, "facts": facts}
+
+
+def load_topic_pool(topics_path: Path) -> List[dict]:
+    """Every valid, unique-id entry of topics.json (bad entries are skipped with a warning, not fatal)."""
+    try:
+        raw = json.loads(topics_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
         raise RuntimeError(f"Could not read {topics_path}: {exc}") from exc
-    if not topics:
-        raise RuntimeError(f"{topics_path} is empty")
-    if day is None:
-        day = (date or datetime.date.today()).timetuple().tm_yday
-    entry = topics[(day - 1) % len(topics)]
-    facts = [ascii_clean(str(f)) for f in entry.get("facts", []) if ascii_clean(str(f))]
-    title = ascii_clean(str(entry.get("title", "")))
-    if len(facts) != FACTS_COUNT or not title:
-        raise RuntimeError(f"topics.json entry for day {entry.get('day')} needs a title and exactly "
-                           f"{FACTS_COUNT} facts (found {len(facts)})")
-    logger.info("Day of year %d -> topics.json day %s: %s", day, entry.get("day"), title)
-    return {"day": int(entry["day"]), "title": title, "facts": facts}
+    if not isinstance(raw, list):
+        raise RuntimeError(f"{topics_path} must contain a JSON list of topics")
+    pool: List[dict] = []
+    seen = set()
+    for entry in raw:
+        topic = _normalize_topic(entry)
+        if topic is None:
+            logger.warning("Skipping malformed topics.json entry (needs day, title and exactly %d facts): %s",
+                           FACTS_COUNT, shorten(str(entry), 80))
+            continue
+        if topic["day"] in seen:
+            logger.warning("Skipping duplicate topic id %s", topic["day"])
+            continue
+        seen.add(topic["day"])
+        pool.append(topic)
+    if not pool:
+        raise RuntimeError(f"{topics_path} has no valid topics")
+    return pool
+
+
+def select_topic(topics_path: Path, day: Optional[int] = None) -> dict:
+    """Random topic from the pool. An explicit `day` forces that exact id (manual override)."""
+    pool = load_topic_pool(topics_path)
+    if day is not None:
+        for topic in pool:
+            if topic["day"] == day:
+                logger.info("Manual override: topic %s: %s", day, topic["title"])
+                return topic
+        raise RuntimeError(f"{topics_path.name} has no topic with day/id {day}")
+    topic = random.choice(pool)
+    logger.info("Random topic %s (pool of %d): %s", topic["day"], len(pool), topic["title"])
+    return topic
 
 
 def subject_from_title(title: str) -> str:
@@ -1514,11 +1549,14 @@ def choose_transitions(count: int, spec: str, seed: int) -> List[Optional[str]]:
 def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int] = None,
                         date: Optional[datetime.date] = None, topics_path: Optional[str] = None,
                         upload=False) -> str:
+    """day = force one topic id (manual override); otherwise a random topic. date is deprecated and ignored."""
     logger.info("Launching AutoShorts pipeline (vertical 1080x1920)...")
+    if date is not None:
+        logger.warning("'date' is ignored: topics are now picked randomly.")
     work_dir = Path(tempfile.mkdtemp(prefix="auto_shorts_"))  # everything intermediate lives here and is deleted
     try:
-        # ---- Phase A: topic of the day -> Writers -> master timeline ----
-        master = generate_timeline(load_topic_for_day(Path(topics_path) if topics_path else TOPICS_FILE, day, date))
+        # ---- Phase A: random topic -> Writers -> master timeline ----
+        master = generate_timeline(select_topic(Path(topics_path) if topics_path else TOPICS_FILE, day))
         for seg in master.segments[1:]:  # segment 0 is the AI opening line
             normalize_fact(seg)
         segs = list(master.segments)
@@ -1610,8 +1648,9 @@ def main() -> None:
     global USE_MUSIC, USE_SFX, ZOOM_START, ZOOM_END, ZOOM_CURVE, TRANSITION_SPEC, TRANSITION_SECONDS
     global TRANSITION_BLUR, POP_SECONDS, HOST_VOICE, RENDER_WORKERS
     parser = argparse.ArgumentParser(description="Generate the vertical '5 facts you didn't know' Short of the day.")
-    parser.add_argument("--day", type=int, default=None, help="topics.json day to use (default: today's day of the year)")
-    parser.add_argument("--date", default=None, help="use the day of the year of this date (YYYY-MM-DD)")
+    parser.add_argument("--day", type=int, default=None,
+                        help="force this topics.json id (default: random topic)")
+    parser.add_argument("--date", default=None, help="DEPRECATED and ignored (topics are picked randomly now)")
     parser.add_argument("--topics", default=None, help=f"topics file (default {TOPICS_FILE.name})")
     parser.add_argument("--output", default=None, help="output mp4 path (default: output/SHORT_DAY###_<timestamp>.mp4)")
     parser.add_argument("--no-music", action="store_true", help="do not mix background music")
@@ -1650,8 +1689,9 @@ def main() -> None:
         HOST_VOICE = cli.voice
     if cli.render_workers:
         RENDER_WORKERS = max(1, cli.render_workers)
-    date = datetime.date.fromisoformat(cli.date) if cli.date else None
-    run_shorts_pipeline(output_filename=cli.output, day=cli.day, date=date, topics_path=cli.topics, upload=True)
+    if cli.date:
+        logger.warning("--date is deprecated and ignored: topics are picked randomly.")
+    run_shorts_pipeline(output_filename=cli.output, day=cli.day, topics_path=cli.topics, upload=True)
 
 
 if __name__ == "__main__":
