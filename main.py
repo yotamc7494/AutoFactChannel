@@ -34,6 +34,7 @@ Optional assets (never fatal if missing)
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime
 import gc
 import json
@@ -51,7 +52,7 @@ import time
 import wave
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -135,6 +136,19 @@ CAPTION_WORDS_MAX = 2  # words per caption chunk
 POP_SECONDS = 0.10  # shorter pop feels closer to the spoken word; 0 disables it
 POP_FROM_SCALE = 0.50  # starts at 50% size ...
 POP_OVERSHOOT = 3.0  # ... overshoots to ~112% and settles (0 = no overshoot, just a scale-up)
+
+# --- KNOBS: active-word highlight -------------------------------------------------------------------------------
+# The word being spoken is filled with ONE colour that is picked at random per video (see pick_highlight_color);
+# every other word keeps CAPTION_BASE_FILL. The black outline and the drop shadow never change.
+CAPTION_BASE_FILL = (255, 255, 255, 255)
+CAPTION_HIGHLIGHT_PALETTE = [
+    "#FFD700",  # gold / yellow
+    "#00FFFF",  # cyan
+    "#39FF14",  # neon green
+    "#FF5E00",  # bright orange
+    "#FF2A85",  # hot pink
+]
+CAPTION_HIGHLIGHT_MIN_DISTANCE = 120  # minimum RGB distance from the base fill, so the highlight can never blend in
 
 # --- Pacing ---
 FACTS_COUNT = 5
@@ -1035,6 +1049,30 @@ def get_sfx_path(name: str, work_dir: Path) -> Optional[str]:
 # =====================================================================
 # 9. DRAWING PRIMITIVES  (fonts, captions, scrim, Ken Burns, transitions with motion blur)
 # =====================================================================
+def hex_to_rgba(value: str) -> Tuple[int, int, int, int]:
+    h = value.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        raise ValueError(f"bad colour {value!r}")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255
+
+
+def pick_highlight_color(base: Tuple[int, int, int, int] = CAPTION_BASE_FILL,
+                         rng: Optional[random.Random] = None) -> Tuple[int, int, int, int]:
+    """One random highlight colour for a whole video. Never equal to (or close to) the inactive text fill."""
+    rng = rng or random.SystemRandom()  # independent of any random.seed() elsewhere
+    palette = [hex_to_rgba(h) for h in CAPTION_HIGHLIGHT_PALETTE]
+    usable = [c for c in palette if math.dist(c[:3], base[:3]) >= CAPTION_HIGHLIGHT_MIN_DISTANCE]
+    if usable:
+        return rng.choice(usable)
+    # Misconfigured palette (every entry too close to the base fill): furthest entry, else a hard-coded safe colour.
+    best = max(palette, key=lambda c: math.dist(c[:3], base[:3]), default=None)
+    if best is not None and best[:3] != base[:3]:
+        return best
+    return next(c for c in (hex_to_rgba("#FFD700"), hex_to_rgba("#00FFFF")) if c[:3] != base[:3])
+
+
 _FONT_CANDIDATES = [
     "C:/Windows/Fonts/impact.ttf", "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/segoeuib.ttf",
     "/System/Library/Fonts/Supplemental/Impact.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -1113,10 +1151,81 @@ def render_text_overlay(font_path: Optional[str], text: str, *, start_size: int,
     return Image.alpha_composite(shade.filter(ImageFilter.GaussianBlur(7)), main)
 
 
-def caption_overlay(font_path: Optional[str], text: str) -> Tuple[Image.Image, Tuple[int, int]]:
-    img = render_text_overlay(font_path, text, start_size=112, min_size=60, max_width=VIDEO_W - 150,
-                              fill=(255, 255, 255, 255))
-    return img, ((VIDEO_W - img.width) // 2, int(VIDEO_H * 0.5 - img.height / 2))
+def _layout_words(scratch: ImageDraw.ImageDraw, font, text: str, max_width: int, stroke: int, spacing: int):
+    """Wrap `text`, centre every line and return [(word, x, y)] plus the ink bounding box (stroke included).
+    The layout depends only on the TEXT, never on which word is highlighted -> no jitter between variants."""
+    lines = wrap_text(scratch, text, font, max_width, stroke).split("\n")
+    pitch = math.ceil(scratch.textbbox((0, 0), "Ag", font=font)[3]) + spacing
+    widths = [scratch.textlength(line, font=font) for line in lines]
+    block_w = max(widths) if widths else 0.0
+    placed: List[Tuple[str, int, int]] = []
+    for li, line in enumerate(lines):
+        words = line.split(" ")
+        line_x = (block_w - widths[li]) / 2.0
+        for wi, word in enumerate(words):
+            if not word:
+                continue
+            prefix = " ".join(words[:wi]) + (" " if wi else "")
+            placed.append((word, round(line_x + scratch.textlength(prefix, font=font)), li * pitch))
+    if not placed:
+        return placed, (0, 0, 1, 1)
+    boxes = [scratch.textbbox((x, y), w, font=font, stroke_width=stroke) for w, x, y in placed]
+    return placed, (int(math.floor(min(b[0] for b in boxes))), int(math.floor(min(b[1] for b in boxes))),
+                    int(math.ceil(max(b[2] for b in boxes))), int(math.ceil(max(b[3] for b in boxes))))
+
+
+def render_word_overlays(font_path: Optional[str], text: str, *, start_size: int, min_size: int, max_width: int,
+                         base_fill: Tuple[int, int, int, int], active_fill: Tuple[int, int, int, int],
+                         stroke_ratio: float = 0.09, shadow: bool = True, pad: int = 36) -> List[Image.Image]:
+    """variants[i] = the caption with word i filled in `active_fill` and all other words in `base_fill`.
+    All variants have the same size, the same glyph positions, the same outline and the same (shared) shadow;
+    only the fill of one word differs, so switching between them cannot move a single pixel of the layout."""
+    scratch = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    size = start_size
+    while True:
+        font = load_font(font_path, size)
+        stroke = round(size * stroke_ratio)
+        spacing = round(size * 0.12)
+        placed, (left, top, right, bottom) = _layout_words(scratch, font, text, max_width, stroke, spacing)
+        if (right - left) <= max_width or size <= min_size:
+            break
+        size -= 4
+    width, height = (right - left) + 2 * pad, (bottom - top) + 2 * pad
+    dx, dy = pad - left, pad - top
+    placed = [(w, x + dx, y + dy) for w, x, y in placed]
+
+    def paint(active: int) -> Image.Image:
+        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        for w, x, y in placed:  # pass 1: all outlines, so no outline can ever cover a neighbour's fill
+            d.text((x, y), w, font=font, fill=(0, 0, 0, 255), stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+        for i, (w, x, y) in enumerate(placed):  # pass 2: the fills
+            d.text((x, y), w, font=font, fill=active_fill if i == active else base_fill)
+        return layer
+
+    shade = None
+    if shadow:
+        shade = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shade)
+        for w, x, y in placed:
+            sd.text((x, y + 7), w, font=font, fill=(0, 0, 0, 210), stroke_width=stroke, stroke_fill=(0, 0, 0, 210))
+        shade = shade.filter(ImageFilter.GaussianBlur(7))
+    out = []
+    for i in range(max(1, len(placed))):
+        layer = paint(i)
+        out.append(Image.alpha_composite(shade, layer) if shade is not None else layer)
+    return out
+
+
+def caption_overlay(font_path: Optional[str], text: str,
+                    base_fill: Tuple[int, int, int, int] = CAPTION_BASE_FILL,
+                    active_fill: Optional[Tuple[int, int, int, int]] = None,
+                    ) -> Tuple[List[Image.Image], Tuple[int, int]]:
+    """-> (one overlay per word = that word highlighted, shared top-left position)."""
+    variants = render_word_overlays(font_path, text, start_size=112, min_size=60, max_width=VIDEO_W - 150,
+                                    base_fill=base_fill, active_fill=active_fill or base_fill)
+    img = variants[0]
+    return variants, ((VIDEO_W - img.width) // 2, int(VIDEO_H * 0.5 - img.height / 2))
 
 
 def apply_scrim(img: Image.Image) -> Image.Image:
@@ -1250,6 +1359,34 @@ class CaptionCue:
     start: float
     end: float
     text: str
+    word_starts: Tuple[float, ...] = ()  # scene-local start time of every word of `text`, non-decreasing
+
+    def active_word(self, t: float) -> int:
+        """Index of the word being spoken at scene time t. A word stays active until the NEXT word starts, so the
+        highlight never flickers off in the tiny gaps between words (and the last word holds until the cue ends)."""
+        n = len(self.text.split())
+        if n == 0 or not self.word_starts:
+            return 0
+        return min(max(bisect.bisect_right(self.word_starts, t) - 1, 0), n - 1)
+
+
+def _estimate_word_starts(words: List[str], start: float, end: float) -> List[float]:
+    """No measured timestamps: split the cue time over its words by length."""
+    weights = [len(w) + 1.0 for w in words]
+    total, acc, out = sum(weights), 0.0, []
+    for wt in weights:
+        out.append(start + (end - start) * acc / total)
+        acc += wt
+    return out
+
+
+def _fit_word_starts(starts: List[float], cue_start: float, n_words: int) -> Tuple[float, ...]:
+    """Exactly n_words non-decreasing start times (punctuation-only tokens can change the displayed word count)."""
+    starts = list(starts[:n_words]) or [cue_start]
+    starts += [starts[-1]] * (n_words - len(starts))
+    for i in range(1, len(starts)):
+        starts[i] = max(starts[i], starts[i - 1])
+    return tuple(starts)
 
 
 def build_caption_cues(sentences: List[str], times: List[List[float]], offset: float, speech_dur: float,
@@ -1296,17 +1433,19 @@ def build_caption_cues(sentences: List[str], times: List[List[float]], offset: f
                 first = word_times[word_idx]
                 last = word_times[word_idx + len(ch) - 1]
                 start, end = offset + first[0], offset + last[1]
+                starts = [offset + word_times[word_idx + k][0] for k in range(len(ch))]
             else:
                 start, end = t, t + wt * unit
+                starts = _estimate_word_starts(ch, start, end)
             text = re.sub(r"[.,;:]+$", "", " ".join(ch)).upper()
-            cues.append(CaptionCue(start, end, text))
+            cues.append(CaptionCue(start, end, text, _fit_word_starts(starts, start, len(text.split()))))
             t += wt * unit
             word_idx += len(ch)
 
     # Hold each caption through the small gap before the next word starts.
-    out = [CaptionCue(c.start, max(c.end, n.start), c.text) for c, n in zip(cues, cues[1:])]
+    out = [replace(c, end=max(c.end, n.start)) for c, n in zip(cues, cues[1:])]
     if cues:
-        out.append(CaptionCue(cues[-1].start, cues[-1].end + 0.25, cues[-1].text))
+        out.append(replace(cues[-1], end=cues[-1].end + 0.25))
     return out
 
 # =====================================================================
@@ -1322,7 +1461,10 @@ class ShortScene:
         sentences = split_sentences(args["seg"]["script"])
         self.cues = build_caption_cues(sentences, args["sentence_times"], args["voice_offset"], args["speech_dur"],
                                        self.style["caption_words"], args.get("word_times"))
-        self.cue_imgs = [caption_overlay(font, c.text) for c in self.cues]
+        base_fill = tuple(self.style.get("base_fill") or CAPTION_BASE_FILL)
+        highlight = self.style.get("highlight_color")  # same colour in every scene of this video
+        self.cue_imgs = [caption_overlay(font, c.text, base_fill, tuple(highlight) if highlight else None)
+                         for c in self.cues]
         self.hold: Optional[Image.Image] = None
         self.transition = args.get("transition")
         prev = args.get("prev")
@@ -1334,7 +1476,8 @@ class ShortScene:
         idx = next((i for i, c in enumerate(self.cues) if c.start <= t < c.end), None)
         if idx is None:
             return
-        img, (x, y) = self.cue_imgs[idx]
+        variants, (x, y) = self.cue_imgs[idx]
+        img = variants[min(self.cues[idx].active_word(t), len(variants) - 1)]  # same size/position for every variant
         dt = t - self.cues[idx].start
         pop = self.style["pop_seconds"]
         if pop > 0 and dt < pop:
@@ -1522,9 +1665,10 @@ def assemble_final_video(scene_paths: List[str], total_seconds: float, output_pa
 # =====================================================================
 # 14. PIPELINE
 # =====================================================================
-def current_style() -> Dict[str, Any]:
+def current_style(highlight_color: Optional[Tuple[int, int, int, int]] = None) -> Dict[str, Any]:
     """Everything the isolated render workers need (module globals do not travel to subprocesses)."""
-    return {"zoom_start": ZOOM_START, "zoom_end": ZOOM_END, "zoom_curve": ZOOM_CURVE,
+    return {"highlight_color": highlight_color or pick_highlight_color(), "base_fill": CAPTION_BASE_FILL,
+            "zoom_start": ZOOM_START, "zoom_end": ZOOM_END, "zoom_curve": ZOOM_CURVE,
             "transition_seconds": TRANSITION_SECONDS, "transition_blur": TRANSITION_BLUR,
             "pop_seconds": POP_SECONDS, "pop_from": POP_FROM_SCALE, "pop_overshoot": POP_OVERSHOOT,
             "caption_words": CAPTION_WORDS_MAX, "font_path": find_font()}
@@ -1551,6 +1695,8 @@ def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int
                         upload=False) -> str:
     """day = force one topic id (manual override); otherwise a random topic. date is deprecated and ignored."""
     logger.info("Launching AutoShorts pipeline (vertical 1080x1920)...")
+    highlight_color = pick_highlight_color()  # ONE colour for the whole video, new random pick every run
+    logger.info("Caption highlight colour for this video: #%02X%02X%02X", *highlight_color[:3])
     if date is not None:
         logger.warning("'date' is ignored: topics are now picked randomly.")
     work_dir = Path(tempfile.mkdtemp(prefix="auto_shorts_"))  # everything intermediate lives here and is deleted
@@ -1583,7 +1729,7 @@ def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int
         logger.info("Narration %.1fs; video runtime %.1fs", sum(durations), total)
 
         # ---- Phase D: timeline -> scene jobs ----
-        style = current_style()
+        style = current_style(highlight_color)
         jobs: List[SceneJob] = []
         cursor = 0.0
         motion_shift = seed % len(MOTIONS)
