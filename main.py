@@ -137,11 +137,11 @@ POP_OVERSHOOT = 3.0  # ... overshoots to ~112% and settles (0 = no overshoot, ju
 
 # --- Pacing ---
 FACTS_COUNT = 5
-FACT_WORDS_MIN, FACT_WORDS_MAX = 8, 50  # safety bounds for broken output, the prompt aims at 20-30
+FACT_WORDS_MIN, FACT_WORDS_MAX = 8, 35  # safety bounds for broken output, the prompt aims at 20-30
 MAX_VIDEO_SECONDS = 58.0
-SEGMENT_PAD = 0.30  # silence after the last word of a scene
-END_PAD = 0.80  # hold on the last picture
-SENTENCE_GAP = 0.14
+SEGMENT_PAD = 0.2  # silence after the last word of a scene
+END_PAD = 0.5  # hold on the last picture
+SENTENCE_GAP = 0.12
 SPEED_SCALE_CAP = 1.25  # TTS may be sped up by at most this factor to fit MAX_VIDEO_SECONDS
 # Used ONLY if Gemini is completely unavailable. The normal path is 100% AI-written.
 FALLBACK_OPENING = "Here are 5 facts about {subject} that you probably never knew."
@@ -188,7 +188,7 @@ class IntroPlan(_Model):
 
 
 class FactSegment(_Model):
-    script: str = Field(description="Spoken narration: the fact first, then a short explanation. 20-30 words")
+    script: str = Field(description="Spoken narration: the fact first, then a short explanation. 14-18 words")
     image_prompt: str = Field(description="One concrete photorealistic scene for a text-to-image model, 9:16")
     sfx: SfxType = Field(default=SfxType.none, description="Sound effect when the picture lands")
 
@@ -604,8 +604,8 @@ def write_fact(entry: dict, subject: str, index: int, previous_tail: str) -> Fac
             1. The FIRST sentence states the fact itself, plainly and completely, so the viewer instantly knows what it
                is. Smooth the wording for speech but keep every number, name and date exactly as given. Never open with
                'did you know', 'here's something' or a vague teaser.
-            2. Then ONE short explanation sentence (8-14 words): why it is true, how it works or why it matters.
-            Total 20-30 words. {closing}
+            2. Then ONE micro-explanation sentence (5-8 words): why it is true or why it matters.
+            Total 14-18 words strictly. {closing}
             Example of the pattern: 'The Rosetta Stone unlocked ancient Egypt. It let scholars finally read hieroglyphs.'
 
             Also choose image_prompt (see the guide) and sfx (none unless a sound effect truly helps: impact for a shocking

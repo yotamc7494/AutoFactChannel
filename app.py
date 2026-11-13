@@ -15,6 +15,7 @@ if trigger:
     if provided_secret == WEBHOOK_SECRET:
         # PING קל: מונע הירדמות ללא הפעלת הפייפליין הכבד
         if trigger == "ping":
+            print("ping")
             st.write("PONG 🏓 - App is awake and ready!")
             st.stop()
 
