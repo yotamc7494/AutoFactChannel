@@ -3,8 +3,8 @@
 auto_shorts_generator.py - retention-first VERTICAL (9:16) "5 facts you didn't know" YouTube Shorts generator.
 
 Same architecture as weekly_recap.py (minus upload and thumbnail):
-  A. Topic: a RANDOM topics.json entry (title + the 5 facts). Stateless on purpose (the server's filesystem resets
-     on every run), so a topic can come up again; with a ~180 topic pool that is an occasional repeat.
+  A. Topic: topics.json entry for TODAY (title + the 5 facts), stateless: the pool is shuffled with a fixed seed and
+     the entry is chosen by date.toordinal() % len(pool), so topics never repeat inside one full pass of the pool.
      Writer LLM (one call for the intro, one call PER fact) -> master timeline (script.json)
         scene 1  = intro: topic image + "Here are 5 facts you didn't know about X"
         scene 2-6 = one scene per fact; every narration opens with the fact itself, then explains it
@@ -16,7 +16,7 @@ Same architecture as weekly_recap.py (minus upload and thumbnail):
   E. Assemble: ffmpeg concat demuxer (stream copy) + optional ducked background music.
 
 Usage
-  python auto_shorts_generator.py [--day 42] [--topics topics.json] [--output out.mp4]
+  python auto_shorts_generator.py [--day 42 | --date 2026-11-11] [--topics topics.json] [--output out.mp4]
                                   [--work-dir DIR] [--save-script s.json] [--load-script s.json]
                                   [--no-music] [--no-sfx] [--zoom 1.30] [--zoom-start 1.0]
                                   [--zoom-curve linear|ease_out|ease_in_out]
@@ -338,9 +338,9 @@ def write_wav_mono(path: str, samples: np.ndarray, sr: int) -> None:
 
 
 # =====================================================================
-# 3. TOPIC SELECTION  (topics.json: [{day, title, facts: [5 strings]}, ...])
-#    Plain random pick from the curated pool. No state is stored anywhere.
-#    "day" is just a unique id here (it no longer means day of the year).
+# 3. TOPIC OF THE DAY  (topics.json: [{day, title, facts: [5 strings]}, ...])
+#    Stateless rotation: fixed-seed shuffle + one step per calendar day (date.toordinal() % pool size).
+#    "day" in topics.json is just a unique id (it no longer means day of the year).
 # =====================================================================
 def _normalize_topic(entry: Any) -> Optional[dict]:
     """A valid topics.json entry -> {day, title, facts}; anything malformed -> None."""
@@ -381,17 +381,32 @@ def load_topic_pool(topics_path: Path) -> List[dict]:
     return pool
 
 
-def select_topic(topics_path: Path, day: Optional[int] = None) -> dict:
-    """Random topic from the pool. An explicit `day` forces that exact id (manual override)."""
+TOPIC_SHUFFLE_SEED = 42  # never change this once videos are live, or the whole rotation order changes
+
+
+def load_topic_for_day(topics_path: Path, day: Optional[int] = None,
+                       date: Optional[datetime.date] = None) -> dict:
+    """Stateless daily topic.
+
+    Default: sort the pool by id, shuffle it with a fixed seed (same order on every machine and every run), then
+    take index date.toordinal() % len(pool). One step per calendar day -> no repeats within any len(pool) days, and
+    the index wraps to the start by itself. `date` picks that date's topic (default: today).
+    `day` is a manual override: it forces the topics.json entry with that exact id.
+    """
     pool = load_topic_pool(topics_path)
     if day is not None:
         for topic in pool:
             if topic["day"] == day:
-                logger.info("Manual override: topic %s: %s", day, topic["title"])
+                logger.info("Manual override: topic id %s: %s", day, topic["title"])
                 return topic
         raise RuntimeError(f"{topics_path.name} has no topic with day/id {day}")
-    topic = random.choice(pool)
-    logger.info("Random topic %s (pool of %d): %s", topic["day"], len(pool), topic["title"])
+    pool.sort(key=lambda t: t["day"])  # file order must not matter
+    random.Random(TOPIC_SHUFFLE_SEED).shuffle(pool)
+    target = date or datetime.date.today()
+    index = target.toordinal() % len(pool)
+    topic = pool[index]
+    logger.info("%s -> rotation slot %d of %d -> topic id %s: %s",
+                target.isoformat(), index + 1, len(pool), topic["day"], topic["title"])
     return topic
 
 
@@ -1693,16 +1708,14 @@ def choose_transitions(count: int, spec: str, seed: int) -> List[Optional[str]]:
 def run_shorts_pipeline(output_filename: Optional[str] = None, day: Optional[int] = None,
                         date: Optional[datetime.date] = None, topics_path: Optional[str] = None,
                         upload=False) -> str:
-    """day = force one topic id (manual override); otherwise a random topic. date is deprecated and ignored."""
+    """day = force one topic id (manual override); date = use that date's slot in the rotation (default today)."""
     logger.info("Launching AutoShorts pipeline (vertical 1080x1920)...")
     highlight_color = pick_highlight_color()  # ONE colour for the whole video, new random pick every run
     logger.info("Caption highlight colour for this video: #%02X%02X%02X", *highlight_color[:3])
-    if date is not None:
-        logger.warning("'date' is ignored: topics are now picked randomly.")
     work_dir = Path(tempfile.mkdtemp(prefix="auto_shorts_"))  # everything intermediate lives here and is deleted
     try:
-        # ---- Phase A: random topic -> Writers -> master timeline ----
-        master = generate_timeline(select_topic(Path(topics_path) if topics_path else TOPICS_FILE, day))
+        # ---- Phase A: topic of the day -> Writers -> master timeline ----
+        master = generate_timeline(load_topic_for_day(Path(topics_path) if topics_path else TOPICS_FILE, day, date))
         for seg in master.segments[1:]:  # segment 0 is the AI opening line
             normalize_fact(seg)
         segs = list(master.segments)
@@ -1795,8 +1808,8 @@ def main() -> None:
     global TRANSITION_BLUR, POP_SECONDS, HOST_VOICE, RENDER_WORKERS
     parser = argparse.ArgumentParser(description="Generate the vertical '5 facts you didn't know' Short of the day.")
     parser.add_argument("--day", type=int, default=None,
-                        help="force this topics.json id (default: random topic)")
-    parser.add_argument("--date", default=None, help="DEPRECATED and ignored (topics are picked randomly now)")
+                        help="force this topics.json id (manual override; default: today's rotation slot)")
+    parser.add_argument("--date", default=None, help="use this date's rotation slot (YYYY-MM-DD, default today)")
     parser.add_argument("--topics", default=None, help=f"topics file (default {TOPICS_FILE.name})")
     parser.add_argument("--output", default=None, help="output mp4 path (default: output/SHORT_DAY###_<timestamp>.mp4)")
     parser.add_argument("--no-music", action="store_true", help="do not mix background music")
@@ -1835,9 +1848,8 @@ def main() -> None:
         HOST_VOICE = cli.voice
     if cli.render_workers:
         RENDER_WORKERS = max(1, cli.render_workers)
-    if cli.date:
-        logger.warning("--date is deprecated and ignored: topics are picked randomly.")
-    run_shorts_pipeline(output_filename=cli.output, day=cli.day, topics_path=cli.topics, upload=True)
+    date = datetime.date.fromisoformat(cli.date) if cli.date else None
+    run_shorts_pipeline(output_filename=cli.output, day=cli.day, date=date, topics_path=cli.topics, upload=False)
 
 
 if __name__ == "__main__":
