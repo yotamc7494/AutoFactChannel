@@ -95,11 +95,11 @@ TOPICS_FILE = Path(os.environ.get("TOPICS_FILE", BASE_DIR / "topics.json"))
 
 # --- LLM (same rotation as weekly_recap.py) ---
 GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest"]
-LLM_MAX_ROUNDS = 5
+LLM_MAX_ROUNDS = 10
 LLM_BASE_DELAY = 2.0
-LLM_MAX_DELAY = 30.0
+LLM_MAX_DELAY = 60.0
 LLM_RETRY_STATUS = {408, 429, 500, 502, 503, 504}
-WRITER_MAX_ROUNDS = 3  # rounds per Writer call
+WRITER_MAX_ROUNDS = 10  # rounds per Writer call
 
 # --- Video (9:16 vertical) ---
 VIDEO_W, VIDEO_H = 1080, 1920
