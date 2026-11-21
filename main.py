@@ -203,7 +203,8 @@ class IntroPlan(_Model):
 
 
 class FactSegment(_Model):
-    script: str = Field(description="Spoken narration: the fact first, then a short explanation. 14-18 words")
+    script: str = Field(description="Spoken narration: fact first, then a short explanation. Normally 14-18 words; "
+                          "the final fact adds a short loop-back hook")
     image_prompt: str = Field(description="One concrete photorealistic scene for a text-to-image model, 9:16")
     sfx: SfxType = Field(default=SfxType.none, description="Sound effect when the picture lands")
 
@@ -504,6 +505,12 @@ FILLER = re.compile(
     r"\b(?:did you know|in conclusion|let'?s dive in|buckle up|without further ado|welcome back|hey guys|"
     r"you won'?t believe|mind[- ]blowing fact|here'?s (?:a|one) (?:fact|thing))\b", re.I)
 GREETING = re.compile(r"^\s*(?:hey|hi|hello|welcome|what'?s up|today (?:we|i))\b", re.I)
+# Catch spoken channel CTAs without blocking factual uses of "follow" (e.g. "birds follow the sun").
+# The final fact must end on a curiosity hook, never a request to follow or subscribe.
+FOLLOW_CTA = re.compile(
+    r"\b(?:subscribe\b|(?:please\s+)?follow\s+(?:me|us|for|my|our|now|along|and)\b|"
+    r"follow\s+to\s+(?:see|watch|learn|get|hear|discover)\b|"
+    r"(?:hit|tap|click)\s+(?:the\s+)?follow\b)", re.I)
 STOPWORDS = {"about", "after", "also", "been", "because", "before", "being", "could", "does", "during", "each",
              "even", "every", "from", "have", "into", "just", "like", "made", "many", "more", "most", "much",
              "only", "other", "over", "same", "some", "such", "than", "that", "their", "them", "then", "there",
@@ -547,8 +554,10 @@ def parse_fact(response, fact: str, near_misses: Optional[list] = None, last: bo
         issues.append("changed or dropped a number from the fact")
     if len(split_sentences(seg.script)) < 2:
         issues.append("no explanation after the fact")
-    if last and not re.search(r"\bfollow\b", seg.script, re.I):
-        issues.append("missing follow invitation")
+    # A CTA is a hard rejection: do not let it back in via the best-draft fallback.
+    # All existing fact-first, number, explanation, filler and word-count checks remain unchanged.
+    if last and FOLLOW_CTA.search(seg.script):
+        raise ValueError("last fact contains a follow/subscribe invitation")
     if issues:
         if near_misses is not None:
             near_misses.append((len(issues), seg))
@@ -650,13 +659,22 @@ STYLE_GUIDE = """
         """
 
 
-def write_fact(entry: dict, subject: str, index: int, previous_tail: str) -> FactSegment:
+def write_fact(entry: dict, subject: str, index: int, previous_tail: str,
+               opening_line: str = "") -> FactSegment:
     from google.genai import types
     fact = entry["facts"][index]
     last = index == len(entry["facts"]) - 1
     logger.info("Writer: fact %d/%d", index + 1, len(entry["facts"]))
-    closing = ("LAST FACT: after the explanation add ONE closing takeaway sentence about the whole topic, then a short "
-               "invitation to follow for more (6-10 words in total for the closing line).") if last else ""
+    # Seamless loop: the writer sees the *actual* opening line, not only the topic.
+    # A short question/curiosity bridge makes the next playback feel continuous, not like an outro.
+    closing = (
+        f"LAST FACT - SEAMLESS LOOP: After the factual sentence and micro-explanation, finish with ONE "
+        f"short, punchy curiosity hook about {subject}. The video loops immediately to its first spoken words: "
+        f'"{opening_line or subject}". Make your final words lead naturally INTO those first words on replay, '
+        "as though the opening answers or continues your hook. Do not repeat the opening line, add unverified "
+        "claims, or sound like an ending. NEVER ask viewers to follow or subscribe; no spoken CTA."
+    ) if last else ""
+    word_target = "Aim for 20-28 words total, never over 35." if last else "Total 14-18 words strictly."
     overview = "\n".join(f"  {i + 1}. {f}" for i, f in enumerate(entry["facts"]))
     prompt = f"""
             You are a charismatic YouTuber writing ONE fact segment (fact {index + 1} of {len(entry['facts'])}) of a Short
@@ -669,7 +687,7 @@ def write_fact(entry: dict, subject: str, index: int, previous_tail: str) -> Fac
                is. Smooth the wording for speech but keep every number, name and date exactly as given. Never open with
                'did you know', 'here's something' or a vague teaser.
             2. Then ONE micro-explanation sentence (5-8 words): why it is true or why it matters.
-            Total 14-18 words strictly. {closing}
+            {word_target} {closing}
             Example of the pattern: 'The Rosetta Stone unlocked ancient Egypt. It let scholars finally read hieroglyphs.'
 
             Also choose image_prompt (see the guide) and sfx (none unless a sound effect truly helps: impact for a shocking
@@ -699,7 +717,7 @@ def generate_timeline(entry: dict) -> ShortTimeline:
     segments = [FactSegment(script=intro.opening_line, image_prompt=intro.image_prompt, sfx=SfxType.none.value)]
     tail = intro.opening_line
     for i in range(len(entry["facts"])):
-        seg = write_fact(entry, intro.subject, i, tail)
+        seg = write_fact(entry, intro.subject, i, tail, opening_line=intro.opening_line)
         segments.append(seg)
         tail = shorten(seg.script, 160)
     return ShortTimeline(day=entry["day"], title=intro.title, subject=intro.subject, description=intro.description,
